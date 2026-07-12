@@ -1,0 +1,16 @@
+[package]
+name = "taco"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.103"
+crossterm = "0.29.0"
+dirs = "6.0.0"
+flate2 = "1.1.9"
+regex = "1.13.0"
+ropey = "1.6.1"
+similar = "3.1.1"
+steel-core = "0.8.2"
+tar = "0.4.46"
+unicode-width = "0.2.2"
