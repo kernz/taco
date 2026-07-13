@@ -1,5 +1,7 @@
 # taco
 
+![img.png](imgs/img.png)
+
 > [!CAUTION]
 > Made with AI use at your own risk
 
@@ -63,6 +65,8 @@ The defaults (all defined in `src/scheme/bootstrap.scm`, rebindable):
 
 ### Help — `C-h`
 
+![img3.png](imgs/img3.png)
+
 | | |
 |---|---|
 | `C-h c KEYS` | which command a key runs (brief echo) |
@@ -75,6 +79,8 @@ The defaults (all defined in `src/scheme/bootstrap.scm`, rebindable):
 Dismiss the `*Help*` window with `C-x 1`, or `q` inside it.
 
 ### Compile — `M-x compile`
+
+![img2.png](imgs/img2.png)
 
 Runs the command **asynchronously**; output streams live into a
 read-only `*compilation*` buffer in the other window while you keep
@@ -98,6 +104,8 @@ Add your own error patterns from init.scm:
 ```
 
 ### Dired — directory editing
+
+![img1.png](imgs/img1.png)
 
 Opening a directory gives an `ls -la`-style listing. Entry points:
 `C-x C-f` on a directory, `C-x C-j` (jump to the current file's
