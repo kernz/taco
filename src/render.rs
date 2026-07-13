@@ -43,6 +43,21 @@ fn clear_highlight(out: &mut impl Write) -> std::io::Result<()> {
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)
 }
 
+/// Color just the gutter digits (never the buffer text, never the gutter
+/// background): a plain foreground color when a face is configured, else the
+/// original look — dim for ordinary lines, bold for the line holding point.
+fn set_line_number_color(
+    out: &mut impl Write,
+    color: Option<FaceColor>,
+    current: bool,
+) -> std::io::Result<()> {
+    match color {
+        Some(c) => queue!(out, SetForegroundColor(crossterm_color(c))),
+        None if current => queue!(out, SetAttribute(Attribute::Bold)),
+        None => queue!(out, SetAttribute(Attribute::Dim)),
+    }
+}
+
 /// Highlighted char-column ranges for one buffer line.
 type LineRanges = Vec<(usize, usize)>;
 
@@ -53,7 +68,18 @@ pub fn draw(ed: &mut Editor, out: &mut impl Write) -> std::io::Result<()> {
     let (tw, th) = ed.term_size;
     let layout = ed.windows.layout(ed.window_area());
     let selected = ed.windows.selected;
-    let faces = ed.faces;
+    let faces = ed.faces.clone();
+
+    // Lazily rehighlight any visible buffer whose text changed since the
+    // last frame (see Buffer::mark_syntax_dirty / SyntaxState) — at most
+    // once per buffer per edit, since a redraw follows every keystroke.
+    for (wid, _) in &layout {
+        let Some(win) = ed.windows.find(*wid) else { continue };
+        let Some(buf) = ed.buffers.get_mut(&win.buffer) else { continue };
+        if let Some(syntax) = buf.syntax.as_mut() {
+            syntax.ensure_current(&buf.rope);
+        }
+    }
 
     queue!(out, cursor::Hide)?;
 
@@ -80,6 +106,7 @@ pub fn draw(ed: &mut Editor, out: &mut impl Write) -> std::io::Result<()> {
             } else {
                 Vec::new()
             };
+            let syntax = syntax_ranges(buf, &faces, line_idx);
             let text = if line_idx < buf.len_lines() {
                 let l: String = buf.rope.line(line_idx).to_string();
                 l.trim_end_matches('\n').to_string()
@@ -92,18 +119,21 @@ pub fn draw(ed: &mut Editor, out: &mut impl Write) -> std::io::Result<()> {
                 } else {
                     " ".repeat(gutter)
                 };
-                // The number of the line holding this window's point stands
-                // out; the buffer text next to it is styled normally.
+                // Only the digits are styled — never the buffer text next to
+                // them. The line holding point gets its own customizable
+                // color (`line-number-current-line`); every other line uses
+                // `line-number`. Both fall back to the original dim/reverse
+                // look when unset.
                 queue!(out, cursor::MoveTo(rect.x, rect.y + row as u16))?;
                 if line_idx == point_line && line_idx < buf.len_lines() {
-                    set_highlight(out, faces.highlight)?;
+                    set_line_number_color(out, faces.line_number_current, true)?;
                 } else {
-                    queue!(out, SetAttribute(Attribute::Dim))?;
+                    set_line_number_color(out, faces.line_number, false)?;
                 }
                 queue!(out, Print(num))?;
                 clear_highlight(out)?;
             }
-            draw_line(out, &text_rect, row as u16, &text, &ranges, &faces)?;
+            draw_line(out, &text_rect, row as u16, &text, &ranges, &syntax, &faces)?;
         }
         draw_mode_line(out, rect, buf, point, *wid == selected, &faces)?;
         if rect.x > 0 {
@@ -217,31 +247,93 @@ fn highlight_ranges(
     ranges
 }
 
+/// Char-column, per-token syntax-color ranges on `line_idx`, from the
+/// buffer's tree-sitter spans (already recomputed for this frame by
+/// `draw`'s ensure_current sweep). Capture names with no configured color
+/// ((set-face-color "keyword" ...) etc.) are simply skipped — no color,
+/// same as any other unset face.
+type SyntaxRanges = Vec<(usize, usize, FaceColor)>;
+
+pub(crate) fn syntax_ranges(buf: &Buffer, faces: &Faces, line_idx: usize) -> SyntaxRanges {
+    let mut ranges = Vec::new();
+    if line_idx >= buf.len_lines() {
+        return ranges;
+    }
+    let ls = buf.line_to_char(line_idx);
+    let le = buf.line_end(ls);
+    // Scheme-placed spans (buffer-add-face-span!) go first: draw_line takes
+    // the first range covering a char, so they win over tree-sitter tokens.
+    for (start, end, name) in &buf.face_spans {
+        let s = (*start).max(ls);
+        let e = (*end).min(le);
+        if s < e {
+            if let Some(&color) = faces.syntax.get(name) {
+                ranges.push((s - ls, e - ls, color));
+            }
+        }
+    }
+    let Some(syntax) = &buf.syntax else { return ranges };
+    for (start, end, name) in &syntax.spans {
+        let s = (*start).max(ls);
+        let e = (*end).min(le);
+        if s < e {
+            if let Some(&color) = faces.syntax.get(*name) {
+                ranges.push((s - ls, e - ls, color));
+            }
+        }
+    }
+    ranges
+}
+
+/// Per-char style while drawing a line: `Bg` (region/isearch-match, a
+/// background flip) always wins over `Fg` (a tree-sitter token's color, a
+/// plain foreground change) when both would apply on the same character —
+/// the same visual rule as a selected region overriding font-lock in Emacs.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum CharStyle {
+    Plain,
+    Bg,
+    Fg,
+}
+
 /// Print one buffer line into a window row: tabs expanded, wide chars
-/// accounted for, truncation marked with '$', highlights reversed.
+/// accounted for, truncation marked with '$', region/search highlights
+/// reversed, tree-sitter tokens colored.
 fn draw_line(
     out: &mut impl Write,
     rect: &Rect,
     row: u16,
     text: &str,
     ranges: &LineRanges,
+    syntax: &SyntaxRanges,
     faces: &Faces,
 ) -> std::io::Result<()> {
     queue!(out, cursor::MoveTo(rect.x, rect.y + row))?;
     let width = rect.w as usize;
     let mut col = 0usize; // display column
     let mut truncated = false;
-    let mut highlighted = false;
+    let mut style = CharStyle::Plain;
 
     for (ci, ch) in text.chars().enumerate() {
-        let want = ranges.iter().any(|(s, e)| ci >= *s && ci < *e);
-        if want != highlighted {
-            if want {
-                set_highlight(out, faces.highlight)?;
-            } else {
-                clear_highlight(out)?;
+        let syntax_color = syntax
+            .iter()
+            .find(|(s, e, _)| ci >= *s && ci < *e)
+            .map(|(_, _, c)| *c);
+        let want = if ranges.iter().any(|(s, e)| ci >= *s && ci < *e) {
+            CharStyle::Bg
+        } else if syntax_color.is_some() {
+            CharStyle::Fg
+        } else {
+            CharStyle::Plain
+        };
+        if want != style {
+            clear_highlight(out)?;
+            match want {
+                CharStyle::Bg => set_highlight(out, faces.highlight)?,
+                CharStyle::Fg => queue!(out, SetForegroundColor(crossterm_color(syntax_color.unwrap())))?,
+                CharStyle::Plain => {}
             }
-            highlighted = want;
+            style = want;
         }
         let w = match ch {
             '\t' => TAB_WIDTH - (col % TAB_WIDTH),
@@ -257,7 +349,7 @@ fn draw_line(
         }
         col += w;
     }
-    if highlighted {
+    if style != CharStyle::Plain {
         clear_highlight(out)?;
     }
     if truncated {
@@ -293,7 +385,7 @@ fn draw_mode_line(
         buf.name,
         line,
         col,
-        buf.mode.name()
+        buf.mode_name
     );
     let width = rect.w as usize;
     while s.chars().count() < width {
@@ -328,8 +420,12 @@ fn draw_completions(
         return Ok(());
     }
     let sel = p.selected.min(p.completions.len() - 1);
-    // Scroll the window of `rows` candidates so the selection stays visible.
-    let start = if sel < rows { 0 } else { sel + 1 - rows };
+    // Keep the selection vertically centered in the candidate window;
+    // near either end of the list it walks to the edge instead, since the
+    // window cannot scroll past the first or last candidate.
+    let start = sel
+        .saturating_sub(rows / 2)
+        .min(p.completions.len() - rows);
     let width = tw as usize;
     for (i, cand) in p.completions[start..start + rows].iter().enumerate() {
         let y = th.saturating_sub(1 + (rows - i) as u16);
@@ -368,7 +464,7 @@ fn draw_echo_line(
         }
         InputMode::ISearch(s) => (search::isearch_echo(s), None),
         InputMode::QueryReplace(s) => (search::query_replace_echo(s), None),
-        InputMode::DescribeKey(_) | InputMode::Normal => {
+        InputMode::DescribeKey { .. } | InputMode::Normal => {
             (ed.echo.clone().unwrap_or_default(), None)
         }
     };

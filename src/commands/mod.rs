@@ -10,7 +10,7 @@ pub mod ring;
 pub mod windows;
 
 use crate::editor::{Editor, InputMode, NativeFn, PrefixArg};
-use crate::{dired, rect, search};
+use crate::{rect, search};
 
 pub struct Spec {
     pub name: &'static str,
@@ -82,33 +82,8 @@ pub const COMMANDS: &[Spec] = &[
     spec!("execute-extended-command", help::execute_extended_command, "Prompt for a command name and run it."),
     spec!("describe-key", help::describe_key, "Read a key sequence and describe the command it runs."),
     spec!("describe-function", help::describe_function, "Prompt for a command name and show its documentation."),
-    // Dired
-    spec!("dired-open-dir", dired::open_dir_cmd, "Prompt for a directory and open it in dired."),
-    spec!("dired-current", dired::current_cmd, "Open the current buffer's directory in dired."),
-    spec!("dired-jump", dired::jump_cmd, "Open dired at the current file's directory, cursor on that file."),
-    spec!("dired-project-root", dired::project_root_cmd, "Open the project root (nearest ancestor with .git) in dired."),
-    spec!("dired-find-file", dired::find_file_cmd, "Visit the file or directory at point."),
-    spec!("dired-find-file-other-window", dired::find_file_other_window_cmd, "Visit the file or directory at point in another window."),
-    spec!("dired-up-directory", dired::up_directory_cmd, "Open the parent directory."),
-    spec!("dired-mark", dired::mark_cmd, "Mark the file at point."),
-    spec!("dired-mark-regexp", dired::mark_regexp_cmd, "Prompt for a regexp and mark all matching files."),
-    spec!("dired-shell-command", dired::shell_command_cmd, "Run a shell command on the marked files (or the file at point)."),
-    spec!("dired-flag-deletion", dired::flag_deletion_cmd, "Flag the file at point for deletion."),
-    spec!("dired-do-flagged-delete", dired::do_flagged_delete_cmd, "Delete the files flagged with D."),
-    spec!("dired-unmark", dired::unmark_cmd, "Unmark the file at point."),
-    spec!("dired-unmark-all", dired::unmark_all_cmd, "Unmark all files."),
-    spec!("dired-do-delete", dired::do_delete_cmd, "Delete the file at point."),
-    spec!("dired-do-rename", dired::do_rename_cmd, "Rename the file at point."),
-    spec!("dired-do-copy", dired::do_copy_cmd, "Copy the file at point."),
-    spec!("dired-create-directory", dired::create_directory_cmd, "Prompt for a name and create a directory."),
-    spec!("dired-diff", dired::diff_cmd, "Diff the file at point against another file."),
-    spec!("dired-compress", dired::compress_cmd, "Compress the file (gz) or directory (tar.gz) at point."),
-    spec!("dired-revert", dired::revert_cmd, "Refresh the dired listing."),
-    spec!("dired-toggle-hidden", dired::toggle_hidden_cmd, "Toggle showing hidden files."),
-    spec!("dired-kill-all", dired::kill_all_cmd, "Kill all dired buffers."),
-    spec!("wgrep-mode", dired::wgrep_mode_cmd, "Make the dired buffer writable to edit file names as plain text."),
-    spec!("wgrep-commit", dired::wgrep_commit_cmd, "Apply the edited file names (renames files on disk)."),
-    spec!("wgrep-abort", dired::wgrep_abort_cmd, "Abort wgrep editing and restore the listing."),
+    // Dired lives entirely in Steel now (src/scheme/dired.scm), registered
+    // there via (define-command ...), not here.
 ];
 
 /// Install every native command into the editor's registry.

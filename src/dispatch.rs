@@ -1,9 +1,9 @@
 //! Key event dispatcher. Chords accumulate in `editor.pending` and walk a
 //! prefix trie (Keymap). Lookup order: active input mode (minibuffer /
-//! isearch / query-replace / describe-key) -> buffer-local map (dired,
-//! wgrep) -> global map -> self-insert fallback.
+//! isearch / query-replace / describe-key) -> the current buffer's local
+//! map (named by `Buffer.local_map`, e.g. dired-mode-map, entirely
+//! Scheme-defined) -> global map -> self-insert fallback.
 
-use crate::buffer::Mode;
 use crate::editor::{CommandFn, Editor, InputMode, PostAction, PrefixArg};
 use crate::keys::{format_seq, Chord, Key};
 use crate::{commands, minibuffer, search};
@@ -51,6 +51,28 @@ impl Keymap {
         match entry {
             Entry::Prefix(sub) => sub.bind(&seq[1..], name),
             Entry::Cmd(_) => unreachable!(),
+        }
+    }
+
+    /// All key sequences bound to command `name` in this map (reverse
+    /// lookup, for C-h's "It is bound to …" and apropos listings). Sorted
+    /// by display string since HashMap iteration order is arbitrary.
+    pub fn bindings_of(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_bindings(name, &mut Vec::new(), &mut out);
+        out.sort();
+        out
+    }
+
+    fn collect_bindings(&self, name: &str, prefix: &mut Vec<Chord>, out: &mut Vec<String>) {
+        for (chord, entry) in &self.map {
+            prefix.push(*chord);
+            match entry {
+                Entry::Cmd(n) if n == name => out.push(format_seq(prefix)),
+                Entry::Cmd(_) => {}
+                Entry::Prefix(sub) => sub.collect_bindings(name, prefix, out),
+            }
+            prefix.pop();
         }
     }
 
@@ -105,7 +127,7 @@ pub fn handle_chord(ed: &mut Editor, chord: Chord) -> PostAction {
             search::query_replace_key(ed, chord);
             return PostAction::None;
         }
-        InputMode::DescribeKey(_) => {
+        InputMode::DescribeKey { .. } => {
             describe_key_chord(ed, chord);
             return PostAction::None;
         }
@@ -140,8 +162,8 @@ pub fn handle_chord(ed: &mut Editor, chord: Chord) -> PostAction {
     ed.pending.push(chord);
     let seq = ed.pending.clone();
 
-    let (local, wgrep_active) = local_map_info(ed);
-    let lookup = resolve(ed, &seq, local, wgrep_active);
+    let local = local_map_info(ed);
+    let lookup = resolve(ed, &seq, &local);
 
     match lookup {
         Lookup::Pending => {
@@ -182,29 +204,15 @@ pub fn handle_chord(ed: &mut Editor, chord: Chord) -> PostAction {
     }
 }
 
-/// Which buffer-local keymap applies to the current buffer.
-fn local_map_info(ed: &Editor) -> (LocalMap, bool) {
-    match &ed.cur_buffer().mode {
-        Mode::Dired(d) if d.wgrep.is_some() => (LocalMap::Wgrep, true),
-        Mode::Dired(_) => (LocalMap::Dired, false),
-        Mode::Fundamental => (LocalMap::None, false),
-    }
+/// Name of the current buffer's local keymap, if any (set via
+/// (use-local-map name) — entirely Scheme's call, Rust has no idea what
+/// modes exist).
+fn local_map_info(ed: &Editor) -> Option<String> {
+    ed.cur_buffer().local_map.clone()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LocalMap {
-    None,
-    Dired,
-    Wgrep,
-}
-
-fn resolve(ed: &Editor, seq: &[Chord], local: LocalMap, _wgrep: bool) -> Lookup {
-    let local_map = match local {
-        LocalMap::None => None,
-        LocalMap::Dired => Some(&ed.dired_map),
-        LocalMap::Wgrep => Some(&ed.wgrep_map),
-    };
-    if let Some(map) = local_map {
+fn resolve(ed: &Editor, seq: &[Chord], local: &Option<String>) -> Lookup {
+    if let Some(map) = local.as_ref().and_then(|name| ed.keymaps.get(name)) {
         match map.lookup(seq) {
             Lookup::None => {}
             hit => return hit,
@@ -247,37 +255,62 @@ pub fn execute_command(ed: &mut Editor, name: &str) -> PostAction {
             f(ed, prefix);
             PostAction::None
         }
-        Callable::Scheme(v) => PostAction::RunScheme(v),
+        Callable::Scheme(v) => PostAction::RunScheme(v, Vec::new()),
     };
     ed.last_command = ed.this_command.take();
     action
 }
 
-/// C-h k: accumulate chords until they resolve (or dead-end) in the maps.
+/// C-h c/k (and (read-key-sequence …)): accumulate chords until they
+/// resolve (or dead-end) in the maps. With a Scheme continuation, the
+/// answer is delivered through ed.deferred (drained by process_chord right
+/// after this returns); without one, the native brief echo answers.
 fn describe_key_chord(ed: &mut Editor, chord: Chord) {
-    let InputMode::DescribeKey(seq) = &mut ed.input else {
+    let InputMode::DescribeKey { seq, .. } = &mut ed.input else {
         return;
     };
     seq.push(chord);
-    let seq = seq.clone();
-    let (local, wgrep) = local_map_info(ed);
-    match resolve(ed, &seq, local, wgrep) {
+    let (seq, prompt, on_done) = match &ed.input {
+        InputMode::DescribeKey { seq, prompt, on_done } => {
+            (seq.clone(), prompt.clone(), on_done.clone())
+        }
+        _ => unreachable!(),
+    };
+    let finish = |ed: &mut Editor, name: Option<String>, on_done: Option<steel::rvals::SteelVal>| {
+        ed.input = InputMode::Normal;
+        match on_done {
+            Some(f) => ed.deferred.push(PostAction::RunScheme(
+                f,
+                vec![
+                    steel::rvals::SteelVal::StringV(format_seq(&seq).into()),
+                    steel::rvals::SteelVal::StringV(name.clone().unwrap_or_default().into()),
+                ],
+            )),
+            None => match name {
+                Some(name) => {
+                    let doc = ed
+                        .registry
+                        .get(&name)
+                        .map(|c| c.doc.clone())
+                        .unwrap_or_default();
+                    ed.message(format!(
+                        "{} runs the command {} — {}",
+                        format_seq(&seq),
+                        name,
+                        doc
+                    ));
+                }
+                None => ed.message(format!("{} is undefined", format_seq(&seq))),
+            },
+        }
+    };
+    let local = local_map_info(ed);
+    match resolve(ed, &seq, &local) {
         Lookup::Pending => {
-            ed.message(format!("Describe key: {}-", format_seq(&seq)));
+            ed.message(format!("{prompt}{}-", format_seq(&seq)));
         }
-        Lookup::Cmd(name) => {
-            ed.input = InputMode::Normal;
-            let doc = ed
-                .registry
-                .get(&name)
-                .map(|c| c.doc.clone())
-                .unwrap_or_default();
-            ed.message(format!("{} runs the command {} — {}", format_seq(&seq), name, doc));
-        }
-        Lookup::None => {
-            ed.input = InputMode::Normal;
-            ed.message(format!("{} is undefined", format_seq(&seq)));
-        }
+        Lookup::Cmd(name) => finish(ed, Some(name), on_done),
+        Lookup::None => finish(ed, None, on_done),
     }
 }
 

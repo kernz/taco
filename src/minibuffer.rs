@@ -9,17 +9,17 @@ use crate::commands::{files, movement};
 use crate::dispatch::{execute_command, Lookup};
 use crate::editor::{Editor, InputMode, PostAction, PromptKind, YesNoAction};
 use crate::keys::{Chord, Key};
-use crate::{dired, rect, search};
+use crate::{rect, search};
+use steel::rvals::SteelVal;
 
 /// Completion domain of a prompt, exposed to Scheme as
 /// (minibuffer-completion-kind). None means the prompt is not completable.
-pub fn completion_kind(kind: &PromptKind) -> Option<&'static str> {
+pub fn completion_kind(kind: &PromptKind) -> Option<&str> {
     match kind {
         PromptKind::ExecuteCommand | PromptKind::DescribeFunction => Some("command"),
         PromptKind::SwitchBuffer => Some("buffer"),
-        PromptKind::FindFile | PromptKind::SaveFileAs | PromptKind::DiredOpenDir => {
-            Some("file")
-        }
+        PromptKind::FindFile | PromptKind::SaveFileAs => Some("file"),
+        PromptKind::Generic { completion, .. } => completion.as_deref(),
         _ => None,
     }
 }
@@ -35,7 +35,7 @@ pub fn handle_key(ed: &mut Editor, chord: Chord) -> PostAction {
         match chord.self_insert_char() {
             Some('y') => {
                 ed.input = InputMode::Normal;
-                perform_yes(ed, action);
+                return perform_yes(ed, action);
             }
             Some('n') => {
                 ed.input = InputMode::Normal;
@@ -113,11 +113,17 @@ fn remove_char(s: &mut String, at: usize) {
     }
 }
 
-fn perform_yes(ed: &mut Editor, action: YesNoAction) {
+fn perform_yes(ed: &mut Editor, action: YesNoAction) -> PostAction {
     match action {
-        YesNoAction::QuitModified => ed.quit = true,
-        YesNoAction::KillModifiedBuffer(id) => ed.remove_buffer(id),
-        YesNoAction::DiredDelete(paths) => dired::delete_paths(ed, &paths),
+        YesNoAction::QuitModified => {
+            ed.quit = true;
+            PostAction::None
+        }
+        YesNoAction::KillModifiedBuffer(id) => {
+            ed.remove_buffer(id);
+            PostAction::None
+        }
+        YesNoAction::Generic(f) => PostAction::RunScheme(f, Vec::new()),
     }
 }
 
@@ -175,20 +181,9 @@ fn complete(ed: &mut Editor, kind: PromptKind, input: String) -> PostAction {
             }
         }
         PromptKind::YesNo(_) => unreachable!("handled per-key"),
-        PromptKind::DiredOpenDir => {
-            let path = ed.resolve_path(&input);
-            if path.is_dir() {
-                dired::open_dired(ed, &path);
-            } else {
-                ed.message(format!("Not a directory: {}", path.display()));
-            }
+        PromptKind::Generic { on_submit, .. } => {
+            return PostAction::RunScheme(on_submit, vec![SteelVal::StringV(input.into())]);
         }
-        PromptKind::DiredRename { from } => dired::rename_to(ed, &from, &input),
-        PromptKind::DiredCopy { from } => dired::copy_to(ed, &from, &input),
-        PromptKind::DiredMkdir => dired::mkdir(ed, &input),
-        PromptKind::DiredDiff { from } => dired::diff_against(ed, &from, &input),
-        PromptKind::DiredShell => dired::run_shell(ed, &input),
-        PromptKind::DiredMarkRegex => dired::mark_regexp(ed, &input),
     }
     PostAction::None
 }

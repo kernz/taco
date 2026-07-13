@@ -43,6 +43,16 @@
 (define (vertico--nth lst i)
   (if (= i 0) (car lst) (vertico--nth (cdr lst) (- i 1))))
 
+;; Directory candidates carry a trailing "/" (see directory-files).
+(define (vertico--directory? name)
+  (let ((l (string-length name)))
+    (and (> l 0) (equal? "/" (substring name (- l 1) l)))))
+
+;; Directories ahead of files, each side keeping its alphabetical order.
+(define (vertico--dirs-first names)
+  (append (filter vertico--directory? names)
+          (filter (lambda (n) (not (vertico--directory? n))) names)))
+
 ;; "dir/par" -> "dir/",  "par" -> ""
 (define (vertico--dir-part s)
   (let loop ((i (- (string-length s) 1)))
@@ -70,7 +80,8 @@
          (let* ((dir (vertico--dir-part input))
                 (part (substring input (string-length dir) (string-length input))))
            (vertico--matching
-            (directory-files (if (equal? dir "") (default-directory) dir))
+            (vertico--dirs-first
+             (directory-files (if (equal? dir "") (default-directory) dir)))
             part)))
         (else '())))
 

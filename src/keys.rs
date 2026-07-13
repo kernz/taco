@@ -91,6 +91,20 @@ fn parse_chord(tok: &str) -> Option<Chord> {
         }
         break;
     }
+    // Emacs kbd angle-bracket names: "<backspace>", "<return>", "<tab>"...
+    // Normalized here so "C-<backspace>" and "C-backspace" bind identically.
+    if let Some(inner) =
+        rest.strip_prefix('<').and_then(|r| r.strip_suffix('>'))
+    {
+        let key = match inner.to_ascii_lowercase().as_str() {
+            "backspace" | "del" | "delete" => Key::Backspace,
+            "return" | "ret" => Key::Enter,
+            "tab" => Key::Tab,
+            "space" | "spc" => Key::Space,
+            _ => return None,
+        };
+        return Some(Chord { ctrl, meta, key });
+    }
     let key = match rest {
         "RET" => Key::Enter,
         "TAB" | "Tab" => Key::Tab,
@@ -184,6 +198,20 @@ mod tests {
         assert_eq!(
             parse_seq("C-M-x").unwrap(),
             vec![Chord { ctrl: true, meta: true, key: Key::Char('x') }]
+        );
+    }
+
+    #[test]
+    fn parses_angle_bracket_names() {
+        assert_eq!(parse_seq("C-<backspace>"), parse_seq("C-backspace"));
+        assert_eq!(parse_seq("M-<return>"), parse_seq("M-RET"));
+        assert_eq!(parse_seq("<tab>"), parse_seq("TAB"));
+        assert_eq!(parse_seq("C-<SPACE>"), parse_seq("C-SPC"));
+        assert_eq!(parse_seq("<foo>"), None);
+        // A bare "<" is still the plain character, not a bracket name.
+        assert_eq!(
+            parse_seq("M-<").unwrap(),
+            vec![Chord { ctrl: false, meta: true, key: Key::Char('<') }]
         );
     }
 

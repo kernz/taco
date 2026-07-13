@@ -3,7 +3,11 @@
 use crate::editor::{Editor, InputMode, PromptKind};
 
 pub fn describe_key(ed: &mut Editor, _n: Option<u32>) {
-    ed.input = InputMode::DescribeKey(Vec::new());
+    ed.input = InputMode::DescribeKey {
+        seq: Vec::new(),
+        prompt: "Describe key: ".to_string(),
+        on_done: None,
+    };
     ed.message("Describe key: ");
 }
 

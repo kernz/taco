@@ -28,7 +28,13 @@ fn vertical_move(ed: &mut Editor, delta: isize) {
     };
     let (win, buf) = ed.cur();
     let line = buf.char_to_line(win.point) as isize + delta;
-    let line = line.clamp(0, buf.len_lines() as isize - 1) as usize;
+    // Like Emacs, moving down past the last line puts point at end of buffer.
+    if line >= buf.len_lines() as isize {
+        win.point = buf.len_chars();
+        ed.message("End of buffer");
+        return;
+    }
+    let line = line.max(0) as usize;
     let start = buf.line_to_char(line);
     let end = buf.line_end(start);
     win.point = (start + goal).min(end);
@@ -173,6 +179,33 @@ mod tests {
         assert_eq!(word_start_before(&b, 16), 13);
         assert_eq!(word_start_before(&b, 13), 8);
         assert_eq!(word_start_before(&b, 3), 0);
+    }
+
+    #[test]
+    fn next_line_on_last_line_goes_to_end_of_buffer() {
+        let mut ed = Editor::new();
+        {
+            let (win, buf) = ed.cur();
+            buf.insert(0, "first\nlast line");
+            win.point = 7; // column 1 of the last line
+        }
+        next_line(&mut ed, None);
+        assert_eq!(ed.windows.selected_ref().point, 15);
+        // The goal column survives, so C-p lands on column 1 of line 0.
+        previous_line(&mut ed, None);
+        assert_eq!(ed.windows.selected_ref().point, 1);
+    }
+
+    #[test]
+    fn next_line_with_trailing_newline_reaches_empty_last_line() {
+        let mut ed = Editor::new();
+        {
+            let (win, buf) = ed.cur();
+            buf.insert(0, "abc\n");
+            win.point = 1;
+        }
+        next_line(&mut ed, None);
+        assert_eq!(ed.windows.selected_ref().point, 4);
     }
 
     #[test]

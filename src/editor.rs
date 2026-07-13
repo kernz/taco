@@ -2,19 +2,21 @@
 //! struct — it only reaches it through the API functions in `scheme::api`,
 //! each of which takes a short-lived borrow via the thread-local.
 
-use crate::buffer::{Buffer, BufferId, Mode};
+use crate::buffer::{Buffer, BufferId};
 use crate::dispatch::Keymap;
 use crate::keys::Chord;
 use crate::killring::KillRing;
+use crate::treesit::TreesitLanguage;
 use crate::window::{Rect, WindowId, WindowTree};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use steel::rvals::SteelVal;
 
 pub type NativeFn = fn(&mut Editor, Option<u32>);
 
 /// Most candidate rows the minibuffer list may occupy (Vertico-style).
-pub const MAX_COMPLETION_ROWS: usize = 6;
+pub const MAX_COMPLETION_ROWS: usize = 10;
 
 pub enum CommandFn {
     Native(NativeFn),
@@ -30,17 +32,21 @@ pub struct Command {
 /// invoked outside any Editor borrow (see scheme::api for the invariant).
 pub enum PostAction {
     None,
-    RunScheme(SteelVal),
+    RunScheme(SteelVal, Vec<SteelVal>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum YesNoAction {
     QuitModified,
     KillModifiedBuffer(BufferId),
-    DiredDelete(Vec<PathBuf>),
+    /// (y-or-n-p prompt on-yes): on-yes is called with no arguments iff the
+    /// user answers y. This is the one generic escape hatch every mode
+    /// (dired included) confirms destructive actions through — no
+    /// mode-specific Rust variant needed.
+    Generic(SteelVal),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PromptKind {
     FindFile,
     SaveFileAs,
@@ -53,13 +59,11 @@ pub enum PromptKind {
     RectInsert,
     DescribeFunction,
     YesNo(YesNoAction),
-    DiredOpenDir,
-    DiredRename { from: PathBuf },
-    DiredCopy { from: PathBuf },
-    DiredMkdir,
-    DiredDiff { from: PathBuf },
-    DiredShell,
-    DiredMarkRegex,
+    /// (read-string prompt initial completion on-submit): on-submit is
+    /// called with the entered string. `completion` is
+    /// "file"/"buffer"/"command"/None. The one generic prompt every mode
+    /// reads input through.
+    Generic { on_submit: SteelVal, completion: Option<String> },
 }
 
 #[derive(Debug)]
@@ -99,8 +103,16 @@ pub enum InputMode {
     Prompt(Prompt),
     ISearch(IsearchState),
     QueryReplace(QueryReplaceState),
-    /// C-h k: collecting the key sequence to describe.
-    DescribeKey(Vec<Chord>),
+    /// C-h c/k — or any (read-key-sequence prompt f) — collecting a key
+    /// sequence. `prompt` is echoed while collecting. When `on_done` is
+    /// set, it is a Scheme continuation receiving the formatted sequence
+    /// and the resolved command name ("" if undefined) via ed.deferred;
+    /// when None, the native brief echo answers directly.
+    DescribeKey {
+        seq: Vec<Chord>,
+        prompt: String,
+        on_done: Option<SteelVal>,
+    },
 }
 
 /// C-u state machine.
@@ -145,12 +157,19 @@ impl FaceColor {
 
 /// Scheme-settable background colors for the two highlighted UI elements:
 /// the selected window's mode line, and highlighted text spans (region,
-/// isearch/query-replace match, current line number in the gutter). `None`
-/// keeps the original reverse-video look.
-#[derive(Debug, Default, Clone, Copy)]
+/// isearch/query-replace match). `None` keeps the original reverse-video
+/// look. `line_number`/`line_number_current` are plain text colors for the
+/// gutter digits only (Emacs' `line-number`/`line-number-current-line`
+/// faces) — never applied to buffer text, and independent of `highlight`.
+/// `syntax` is the open-ended set of tree-sitter capture-name colors (any
+/// `(set-face-color name color)` whose name isn't one of the above).
+#[derive(Debug, Default, Clone)]
 pub struct Faces {
     pub mode_line: Option<FaceColor>,
     pub highlight: Option<FaceColor>,
+    pub line_number: Option<FaceColor>,
+    pub line_number_current: Option<FaceColor>,
+    pub syntax: HashMap<String, FaceColor>,
 }
 
 pub struct Editor {
@@ -162,8 +181,10 @@ pub struct Editor {
     pub kill_ring: KillRing,
     pub registry: HashMap<String, Command>,
     pub global_map: Keymap,
-    pub dired_map: Keymap,
-    pub wgrep_map: Keymap,
+    /// Named buffer-local keymaps (dired-mode-map, ...), populated purely
+    /// from Scheme via (define-key map-name seq cmd) — Rust knows nothing
+    /// about which modes exist. Selected per-buffer via `Buffer.local_map`.
+    pub keymaps: HashMap<String, Keymap>,
     /// Consulted (single chords only) before the built-in prompt editing
     /// while the minibuffer is active — how plugins bind C-n/RET/TAB there.
     pub minibuffer_map: Keymap,
@@ -186,9 +207,31 @@ pub struct Editor {
     pub show_line_numbers: bool,
     /// Scheme-settable face colors (set-face-color).
     pub faces: Faces,
+    /// Grammars installed via (tree-sit-install-language-grammar name url),
+    /// keyed by name. `Rc` since (tree-sit-enable name) hands each buffer
+    /// its own `SyntaxState` built from the same query strings.
+    pub treesit_languages: HashMap<String, Rc<TreesitLanguage>>,
+    /// Set by `find_file_path` when it visits a real file (not a
+    /// directory); consumed once by `process_chord`/main.rs to fire
+    /// "find-file-hook" outside any Editor borrow.
+    pub file_visited: bool,
     pub term_size: (u16, u16),
     /// Region inserted by the last yank, for M-y replacement.
     pub last_yank: Option<(usize, usize)>,
+    /// Live left-button drag: window it started in and the anchor point
+    /// there. A drag extends a region from the anchor; a click without
+    /// movement leaves no region.
+    pub mouse_drag: Option<(WindowId, usize)>,
+    /// Live background processes (start-process), keyed by their Scheme-
+    /// visible id. Drained by scheme::pump_processes from the main loop.
+    pub processes: HashMap<u64, crate::process::ProcessHandle>,
+    next_process_id: u64,
+    /// The Scheme function to call (with a path string) when Rust needs to
+    /// visit a directory (e.g. `find-file` on one) — set once by dired.scm
+    /// via (register-directory-opener open-dired). Rust has no idea what
+    /// "dired" is; this is the one hook that lets file-opening code hand
+    /// off to whatever mode wants to own directories.
+    pub directory_opener: Option<SteelVal>,
 }
 
 impl Editor {
@@ -204,8 +247,7 @@ impl Editor {
             kill_ring: KillRing::default(),
             registry: HashMap::new(),
             global_map: Keymap::default(),
-            dired_map: Keymap::default(),
-            wgrep_map: Keymap::default(),
+            keymaps: HashMap::new(),
             minibuffer_map: Keymap::default(),
             pending: Vec::new(),
             deferred: Vec::new(),
@@ -219,8 +261,14 @@ impl Editor {
             rect_mode: false,
             show_line_numbers: false,
             faces: Faces::default(),
+            treesit_languages: HashMap::new(),
+            file_visited: false,
             term_size: (80, 24),
             last_yank: None,
+            mouse_drag: None,
+            processes: HashMap::new(),
+            next_process_id: 1,
+            directory_opener: None,
         }
     }
 
@@ -270,6 +318,43 @@ impl Editor {
             .values()
             .find(|b| b.name == name)
             .map(|b| b.id)
+    }
+
+    pub fn alloc_process_id(&mut self) -> u64 {
+        let id = self.next_process_id;
+        self.next_process_id += 1;
+        id
+    }
+
+    /// Append generated text to buffer `id` (see Buffer::append_generated)
+    /// and make windows showing it follow the output: a window whose point
+    /// sat at the old end of buffer keeps point at the end and scrolls so
+    /// the tail stays visible; a window whose point was moved away by the
+    /// user is left alone (Emacs' window-point-insertion-type behavior).
+    /// Non-selected windows need the explicit scroll: render's
+    /// ensure_point_visible only tracks the selected window. Returns the
+    /// appended char range.
+    pub fn append_to_buffer(&mut self, id: BufferId, text: &str) -> (usize, usize) {
+        let (old_len, new_len, last_line) = {
+            let Some(buf) = self.buffers.get_mut(&id) else { return (0, 0) };
+            let (old, new) = buf.append_generated(text);
+            (old, new, buf.char_to_line(new))
+        };
+        if old_len == new_len {
+            return (old_len, new_len);
+        }
+        for (wid, rect) in self.windows.layout(self.window_area()) {
+            let Some(win) = self.windows.find_mut(wid) else { continue };
+            if win.buffer != id || win.point != old_len {
+                continue;
+            }
+            win.point = new_len;
+            let height = rect.text_height().max(1);
+            if last_line >= win.top_line + height {
+                win.top_line = last_line + 1 - height;
+            }
+        }
+        (old_len, new_len)
     }
 
     pub fn buffer_by_path(&self, path: &std::path::Path) -> Option<BufferId> {
@@ -400,8 +485,8 @@ impl Editor {
     /// dired directory, else the process cwd.
     pub fn default_dir(&self) -> PathBuf {
         let buf = self.cur_buffer();
-        if let Mode::Dired(d) = &buf.mode {
-            return d.dir.clone();
+        if let Some(SteelVal::StringV(s)) = buf.locals.get("dired-directory") {
+            return PathBuf::from(s.as_str());
         }
         if let Some(p) = &buf.path {
             if let Some(parent) = p.parent() {

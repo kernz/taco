@@ -1,8 +1,9 @@
 //! File and buffer lifecycle commands.
 
 use crate::buffer::Buffer;
-use crate::editor::{Editor, PromptKind, YesNoAction};
+use crate::editor::{Editor, PostAction, PromptKind, YesNoAction};
 use std::path::Path;
+use steel::rvals::SteelVal;
 
 pub fn find_file(ed: &mut Editor, _n: Option<u32>) {
     let dir = ed.default_dir();
@@ -14,19 +15,28 @@ pub fn find_file(ed: &mut Editor, _n: Option<u32>) {
 }
 
 /// Visit `path` directly (used by prompt completion and the Scheme API).
-/// Directories open in dired.
+/// Directories hand off to whatever mode registered itself as the
+/// directory opener (dired.scm, normally) — queued like any other
+/// engine-reentry, since this can run with an Editor borrow held.
 pub fn find_file_path(ed: &mut Editor, path: &Path) {
     if path.is_dir() {
-        crate::dired::open_dired(ed, path);
+        if let Some(f) = ed.directory_opener.clone() {
+            let arg = SteelVal::StringV(path.display().to_string().into());
+            ed.deferred.push(PostAction::RunScheme(f, vec![arg]));
+        } else {
+            ed.message("No directory opener registered (dired.scm not loaded?)");
+        }
         return;
     }
     if let Some(id) = ed.buffer_by_path(path) {
         ed.show_buffer(id);
+        ed.file_visited = true;
         return;
     }
     match ed.add_buffer(|id| Buffer::from_file(id, path)) {
         Ok(id) => {
             ed.show_buffer(id);
+            ed.file_visited = true;
             if !path.exists() {
                 ed.message("(New file)");
             }

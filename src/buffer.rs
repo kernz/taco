@@ -1,30 +1,20 @@
 //! Text buffers: a ropey Rope plus file association, modification state,
 //! the mark, the undo log, and the major mode. All positions are char indices.
+//!
+//! Modes live in Steel, not here: `mode_name` is only ever read by Rust for
+//! the mode-line string, `local_map` names the buffer-local Keymap (if any)
+//! in `Editor.keymaps`, and `locals` is a generic Scheme-owned scratch space
+//! (Emacs-style buffer-local variables) that Rust never inspects.
 
-use crate::dired::DiredState;
+use crate::treesit::SyntaxState;
 use crate::undo::{UndoLog, UndoRecord};
 use anyhow::{Context, Result};
 use ropey::Rope;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use steel::rvals::SteelVal;
 
 pub type BufferId = usize;
-
-#[derive(Debug, Default)]
-pub enum Mode {
-    #[default]
-    Fundamental,
-    Dired(DiredState),
-}
-
-impl Mode {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Mode::Fundamental => "Fundamental",
-            Mode::Dired(d) if d.wgrep.is_some() => "Dired:Wgrep",
-            Mode::Dired(_) => "Dired",
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct Buffer {
@@ -37,7 +27,20 @@ pub struct Buffer {
     /// The mark (C-SPC). `mark_active` distinguishes a live region.
     pub mark: Option<usize>,
     pub mark_active: bool,
-    pub mode: Mode,
+    /// Mode-line display name, Scheme-settable via (set-buffer-mode-name).
+    pub mode_name: String,
+    /// Name of this buffer's active keymap in `Editor.keymaps`, if any, set
+    /// via (use-local-map name).
+    pub local_map: Option<String>,
+    /// Generic buffer-local Scheme storage (buffer-local-set!/-get).
+    pub locals: HashMap<String, SteelVal>,
+    /// Tree-sitter highlight state, set by (tree-sit-enable lang).
+    pub syntax: Option<SyntaxState>,
+    /// Scheme-placed color spans (buffer-add-face-span!): (char_start,
+    /// char_end, face name). Static — they don't shift with edits — so
+    /// they're meant for generated read-only buffers (compilation/grep
+    /// results) and are dropped whenever set_text regenerates the content.
+    pub face_spans: Vec<(usize, usize, String)>,
     pub undo: UndoLog,
     /// Point to restore when the buffer is next shown in a window.
     pub last_point: usize,
@@ -56,7 +59,11 @@ impl Buffer {
             read_only: false,
             mark: None,
             mark_active: false,
-            mode: Mode::Fundamental,
+            mode_name: "Fundamental".to_string(),
+            local_map: None,
+            locals: HashMap::new(),
+            syntax: None,
+            face_spans: Vec::new(),
             undo: UndoLog::default(),
             last_point: 0,
             replaying: false,
@@ -96,6 +103,7 @@ impl Buffer {
         self.rope.insert(at, text);
         self.modified = true;
         self.mark_active = false;
+        self.mark_syntax_dirty();
         if !self.replaying {
             self.undo
                 .record(UndoRecord::Insert { at, len: text.chars().count() });
@@ -113,11 +121,44 @@ impl Buffer {
         self.rope.remove(start..end);
         self.modified = true;
         self.mark_active = false;
+        self.mark_syntax_dirty();
         if !self.replaying {
             self.undo
                 .record(UndoRecord::Delete { at: start, text: text.clone() });
         }
         text
+    }
+
+    /// Atomically replace the whole buffer (e.g. a mode like dired
+    /// regenerating its listing): no per-character undo entries, and
+    /// `modified` stays false since generated text isn't user-authored.
+    pub fn set_text(&mut self, text: &str) {
+        self.rope = Rope::from_str(text);
+        self.modified = false;
+        self.face_spans.clear();
+        self.mark_syntax_dirty();
+    }
+
+    /// Append generated text at end of buffer — the streaming counterpart
+    /// of `set_text` (process output landing in a results buffer): no undo
+    /// entries, `modified` untouched, read-only ignored. Returns the char
+    /// lengths before and after.
+    pub fn append_generated(&mut self, text: &str) -> (usize, usize) {
+        let old = self.len_chars();
+        if text.is_empty() {
+            return (old, old);
+        }
+        self.rope.insert(old, text);
+        self.mark_syntax_dirty();
+        (old, self.len_chars())
+    }
+
+    /// No incremental reparse (see `SyntaxState`): any edit just asks for a
+    /// full rehighlight next time the buffer is drawn.
+    fn mark_syntax_dirty(&mut self) {
+        if let Some(s) = &mut self.syntax {
+            s.mark_dirty();
+        }
     }
 
     /// Revert one undo group. Returns the char position to move point to,
@@ -145,6 +186,7 @@ impl Buffer {
         }
         self.replaying = false;
         self.modified = true;
+        self.mark_syntax_dirty();
         point
     }
 
