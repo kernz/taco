@@ -1,5 +1,7 @@
 # taco
 
+[!CAUTION] > Made with AI use at your own risk
+
 A terminal-only Emacs, built as a small Rust core driving an embedded
 [Steel](https://github.com/mattwparas/steel) Scheme interpreter.
 
