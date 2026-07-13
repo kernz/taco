@@ -5,9 +5,11 @@
 ;; nothing here is wired into the editor core.
 ;;
 ;; What it does, once loaded:
-;;   * Every completable prompt (M-x, C-x C-f, C-x b, C-h f, dired paths)
-;;     shows its candidates vertically under the prompt, up to 6 rows,
-;;     refreshed on every keystroke. The selected candidate is highlighted.
+;;   * Every completable prompt (M-x, C-x C-f, C-x b, C-h f, M-x man,
+;;     dired paths) shows its candidates vertically under the prompt, up
+;;     to 6 rows, refreshed on every keystroke. The selected candidate is
+;;     highlighted. (The man source is man.scm's (man-topic-names), so
+;;     this file must load after the built-ins — init.scm always does.)
 ;;   * C-n / C-p cycle the selection (wrapping at either end).
 ;;   * RET submits the selected candidate (or your literal input when
 ;;     nothing matches).
@@ -27,18 +29,6 @@
 (define vertico--last-prompt "")   ;; detects prompt->prompt transitions
 
 ;; ---- Small string/list helpers --------------------------------------------
-
-(define (vertico--prefix? p s)
-  (and (<= (string-length p) (string-length s))
-       (equal? p (substring s 0 (string-length p)))))
-
-(define (vertico--substring? needle hay)
-  (let ((nl (string-length needle))
-        (hl (string-length hay)))
-    (let loop ((i 0))
-      (cond ((> (+ i nl) hl) #f)
-            ((equal? needle (substring hay i (+ i nl))) #t)
-            (else (loop (+ i 1)))))))
 
 (define (vertico--nth lst i)
   (if (= i 0) (car lst) (vertico--nth (cdr lst) (- i 1))))
@@ -61,21 +51,20 @@
           (else (loop (- i 1))))))
 
 ;; ---- Matching --------------------------------------------------------------
-;; Adapted from vertico's default completion styles: prefix matches first,
-;; then substring matches, both in the source's (sorted) order.
+;; Vertico's default completion styles — prefix matches first, then
+;; substring matches, both in the source's (sorted) order — via the
+;; native filter-matching: candidate lists can be thousands long (M-x
+;; man's apropos list) and this runs on every keystroke.
 
 (define (vertico--matching candidates input)
-  (if (equal? input "")
-      candidates
-      (append
-       (filter (lambda (c) (vertico--prefix? input c)) candidates)
-       (filter (lambda (c) (and (not (vertico--prefix? input c))
-                                (vertico--substring? input c)))
-               candidates))))
+  (filter-matching candidates input))
 
 (define (vertico--compute input kind)
   (cond ((equal? kind "command") (vertico--matching (command-names) input))
         ((equal? kind "buffer")  (vertico--matching (buffer-names) input))
+        ;; man.scm's prompt: every page apropos knows, as "name(section)";
+        ;; the "3 mal" section-scoped form is handled by the source itself.
+        ((equal? kind "man")     (man-completion-candidates input))
         ((equal? kind "file")
          (let* ((dir (vertico--dir-part input))
                 (part (substring input (string-length dir) (string-length input))))

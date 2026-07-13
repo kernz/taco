@@ -96,6 +96,47 @@ pub fn register(engine: &mut Engine) {
             Err(e) => vec![String::new(), e.to_string()],
         }
     });
+    // Newline split of an arbitrary string (buffer-lines' free-standing
+    // sibling). Native because Scheme-side splitting walks the string
+    // char-by-char through the interpreter — hopeless on e.g. the 300KB
+    // of `man -k .` output man.scm feeds through this.
+    engine.register_fn("string-lines", |s: String| -> Vec<String> {
+        s.lines().map(|l| l.to_string()).collect()
+    });
+    // Completion-style candidate matching: prefix matches first, then
+    // plain substring matches, each side keeping the source order (the
+    // ordering of vertico's default completion styles). Native because a
+    // completion UI runs this on every keystroke, over candidate lists
+    // that can be thousands long (M-x man's apropos list) — far too hot
+    // for the interpreter.
+    engine.register_fn(
+        "filter-matching",
+        |candidates: Vec<String>, input: String| -> Vec<String> {
+            if input.is_empty() {
+                return candidates;
+            }
+            let mut prefix = Vec::new();
+            let mut substring = Vec::new();
+            for c in candidates {
+                if c.starts_with(&input) {
+                    prefix.push(c);
+                } else if c.contains(&input) {
+                    substring.push(c);
+                }
+            }
+            prefix.extend(substring);
+            prefix
+        },
+    );
+    // filter-matching's companion for tagged candidate lists ("name(3)"):
+    // keep the candidates ending in `suffix`, source order kept. Native
+    // for the same per-keystroke-over-thousands reason.
+    engine.register_fn(
+        "filter-suffix",
+        |candidates: Vec<String>, suffix: String| -> Vec<String> {
+            candidates.into_iter().filter(|c| c.ends_with(&suffix)).collect()
+        },
+    );
     engine.register_fn("regexp-match?", |pattern: String, text: String| {
         regex::Regex::new(&pattern)
             .map(|re| re.is_match(&text))

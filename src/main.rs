@@ -31,6 +31,7 @@ fn main() -> anyhow::Result<()> {
     scheme::load_bootstrap(&mut engine);
     scheme::load_compile(&mut engine);
     scheme::load_help(&mut engine);
+    scheme::load_man(&mut engine);
     scheme::load_dired(&mut engine);
     scheme::load_rust_mode(&mut engine);
     scheme::load_python_mode(&mut engine);

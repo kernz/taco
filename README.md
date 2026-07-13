@@ -103,6 +103,28 @@ Add your own error patterns from init.scm:
  (list "mytool" "^MYTOOL ([^ :]+) line ([0-9]+)" 1 2 #f "error"))
 ```
 
+### Man — `M-x man`
+
+Reads a Unix manual page (`ls`, `2 open`, or `printf(3)` — the prompt
+defaults to the reference at point) **asynchronously** into a read-only
+`*Man TOPIC*` buffer shown in the other window without stealing focus.
+With the vertico plugin loaded, the prompt completes over every page
+apropos knows; typing Emacs' `SEC NAME` form (`3 mall`) completes names
+within that section only.
+The page is formatted to your window width; nroff's bold and underline
+overstrikes become the `Man-overstrike` / `Man-underline` faces
+(recolor them with `set-face-color`).
+
+| | |
+|---|---|
+| `RET` | follow the `name(sec)` reference at point |
+| `r` | follow a reference through the prompt (editable) |
+| `n` / `p` | next / previous section heading |
+| `g` / `s` | go to a section by name / to SEE ALSO |
+| `m` | fetch another man page |
+| `SPC` / `DEL` | scroll |
+| `k` / `q` | kill the buffer and window / quit the window |
+
 ### Dired — directory editing
 
 ![img1.png](imgs/img1.png)
@@ -123,6 +145,19 @@ directory, cursor on that file), `C-c f d` (prompt for a directory),
 | `!` / `=` / `Z` | shell command on marked / diff / compress |
 | `g` / `)` / `q` | refresh / toggle dotfiles / quit |
 | `C-c C-q` | **wdired**: edit file names as text; `C-c C-c` applies the renames, `C-c C-k` aborts |
+
+### Runtime evaluation — `M-:`
+
+The editor's own interpreter, reachable from inside the editor: redefine
+any Scheme-level command or helper in a scratch buffer, evaluate it, and
+the running editor changes immediately — no restart.
+
+| | |
+|---|---|
+| `M-:` | evaluate an expression from the minibuffer, echo its value |
+| `C-x C-e` | evaluate the s-expression before point, echo its value |
+| `M-x eval-buffer` | evaluate the whole current buffer |
+| `M-x load-file` | load a Scheme file into the running editor |
 
 ### Language modes
 
@@ -181,11 +216,12 @@ Key sequence syntax is Emacs-flavored: `"C-x C-f"`, `"M-<"`, `"% m"`,
 ### `examples/`
 
 - **`examples/vertico.scm`** — a Vertico-style vertical completion UI
-  for every completable prompt (M-x, files, buffers): candidates listed
-  under the prompt, `C-n`/`C-p` to choose, `TAB` to complete/descend,
-  `RET` to submit. Pure plugin: it hangs off the minibuffer hooks and
-  `(minibuffer-show-candidates ...)`. Install by `require`-ing it (or
-  pasting it) from your init.scm.
+  for every completable prompt (M-x, files, buffers, man topics):
+  candidates listed under the prompt, `C-n`/`C-p` to choose, `TAB` to
+  complete/descend, `RET` to submit. With it loaded, `M-x man` completes
+  over every page apropos knows, as `name(section)`. Pure plugin: it
+  hangs off the minibuffer hooks and `(minibuffer-show-candidates ...)`.
+  Install by `require`-ing it (or pasting it) from your init.scm.
 - **`examples/treesitter-rust.scm`** — the minimal
   install-grammar + extension + faces recipe, kept as a template for
   adding languages (Rust itself is already built in).
@@ -241,13 +277,13 @@ src/
     mod.rs           the Rust<->Steel contract (every primitive)
     fs.rs            filesystem/regex/text primitives
     bootstrap.scm    default keymap, hooks, shared helpers
-    compile.scm  help.scm  dired.scm
+    compile.scm  help.scm  man.scm  dired.scm
     rust-mode.scm  python-mode.scm  c-mode.scm  scheme-mode.scm
 examples/            optional plugins (vertico, tree-sitter template)
 ```
 
-Load order: `bootstrap.scm` → `compile.scm` → `help.scm` → `dired.scm`
-→ language modes → your `init.scm`.
+Load order: `bootstrap.scm` → `compile.scm` → `help.scm` → `man.scm` →
+`dired.scm` → language modes → your `init.scm`.
 
 ## Tests
 
@@ -259,6 +295,8 @@ Every built-in `.scm` file has a loads-cleanly guard (Steel fails a
 whole file on one bad identifier), and the big features are covered by
 headless end-to-end tests that drive the real key-dispatch path — a
 fake compiler streaming into `*compilation*`, dired marking/wdired
-renames on a temp tree, the C-h flows, mouse drag-selection. One test
+renames on a temp tree, the C-h flows, the real system `man` into a
+fontified `*Man*` buffer, mouse drag-selection. One test
 (`tree_sitter_install_and_highlight_rust`) needs network + a C compiler
-the first time; everything else runs offline.
+the first time; everything else runs offline (`man_end_to_end` needs
+man and its pages installed).

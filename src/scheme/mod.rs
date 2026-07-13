@@ -247,6 +247,17 @@ pub fn build_engine() -> Engine {
     engine.register_fn("default-directory", || {
         with_editor(|ed| ed.default_dir().display().to_string())
     });
+    // Text-area width of the selected window in columns (Emacs'
+    // window-width, minus the line-number gutter when it's showing) — how
+    // man.scm sizes MANWIDTH, and generally the only sane wrap target a
+    // Scheme formatter has.
+    engine.register_fn("window-width", || {
+        with_editor(|ed| {
+            let rect = ed.window_rect(ed.windows.selected);
+            let gutter = crate::render::gutter_width(ed, ed.cur_buffer(), &rect);
+            (rect.w as usize).saturating_sub(gutter) as isize
+        })
+    });
 
     // Help introspection: the registry doc string of a command, every key
     // sequence bound to it (global map plus all named buffer-local maps),
@@ -676,6 +687,12 @@ pub fn load_help(engine: &mut Engine) {
     run(engine, include_str!("help.scm"), "help.scm");
 }
 
+/// man.scm loads after compile.scm for the same reason help.scm does: its
+/// *Man* buffer q binding reuses compile.scm's quit-window command.
+pub fn load_man(engine: &mut Engine) {
+    run(engine, include_str!("man.scm"), "man.scm");
+}
+
 pub fn load_dired(engine: &mut Engine) {
     run(engine, include_str!("dired.scm"), "dired.scm");
 }
@@ -939,6 +956,400 @@ mod tests {
         assert!(text.contains("You have typed C-h, the help character"), "{text}");
     }
 
+    /// Runtime evaluation, through the real key path: M-: echoes the value
+    /// and mutates the global environment, C-x C-e picks the right sexp
+    /// (nesting, strings with parens, quote prefixes), eval-buffer runs a
+    /// whole buffer, load-file loads from disk — and a built-in
+    /// Scheme-level command can be redefined live, the Emacs property the
+    /// whole feature exists for.
+    #[test]
+    fn eval_commands_end_to_end() {
+        let mut engine = build_engine();
+        load_bootstrap(&mut engine);
+        let feed = |engine: &mut Engine, keys: &str| {
+            for chord in parse_seq(keys).unwrap() {
+                process_chord(engine, chord);
+            }
+        };
+        let type_text = |engine: &mut Engine, text: &str| {
+            for c in text.chars() {
+                process_chord(engine, crate::keys::Chord {
+                    ctrl: false,
+                    meta: false,
+                    key: crate::keys::Key::Char(c),
+                });
+            }
+        };
+        let check = |engine: &mut Engine, src: &str| {
+            let result = engine.compile_and_run_raw_program(src.to_string()).unwrap();
+            assert_eq!(format!("{:?}", result.last().unwrap()), "#true", "failed: {src}");
+        };
+
+        // M-: (+ 1 2) echoes 3.
+        feed(&mut engine, "M-:");
+        with_editor(|ed| {
+            let InputMode::Prompt(p) = &ed.input else { panic!("M-: no prompt") };
+            assert_eq!(p.prompt, "Eval: ");
+        });
+        type_text(&mut engine, "(+ 1 2)");
+        feed(&mut engine, "RET");
+        with_editor(|ed| assert_eq!(ed.echo.as_deref(), Some("3")));
+
+        // M-: (define ...) mutates the live global environment.
+        feed(&mut engine, "M-:");
+        type_text(&mut engine, "(define taco-eval-var 31)");
+        feed(&mut engine, "RET");
+        check(&mut engine, "(equal? taco-eval-var 31)");
+
+        // C-x C-e on the sexp before point: nested position, a string
+        // containing parens, and a quote prefix.
+        let set_buffer = |text: &str| {
+            with_editor(|ed| {
+                let (win, buf) = ed.cur();
+                buf.set_text(text);
+                win.point = buf.len_chars();
+            })
+        };
+        set_buffer("(list (* 6 7))");
+        with_editor(|ed| ed.windows.selected_mut().point = 13); // after inner )
+        feed(&mut engine, "C-x C-e");
+        with_editor(|ed| assert_eq!(ed.echo.as_deref(), Some("42")));
+
+        set_buffer("(string-append \"a)b\" \"c\")  ");
+        feed(&mut engine, "C-x C-e");
+        with_editor(|ed| assert_eq!(ed.echo.as_deref(), Some("a)bc")));
+
+        set_buffer("'(1 2)");
+        feed(&mut engine, "C-x C-e");
+        with_editor(|ed| assert_eq!(ed.echo.as_deref(), Some("(1 2)")));
+
+        set_buffer("no sexp here (");
+        feed(&mut engine, "C-x C-e");
+        with_editor(|ed| {
+            // "(" opened and never closed: the atom before it is not what
+            // ends at point, so nothing qualifies.
+            assert_eq!(ed.echo.as_deref(), Some("No s-expression before point"));
+        });
+
+        // eval-buffer: several top-level forms, later ones see earlier ones.
+        set_buffer("(define eb-a 5)\n(define eb-b (+ eb-a 2))\n");
+        engine.compile_and_run_raw_program("(eval-buffer)".to_string()).unwrap();
+        check(&mut engine, "(equal? eb-b 7)");
+
+        // load-file through its prompt.
+        let path = std::env::temp_dir().join(format!("taco-load-{}.scm", std::process::id()));
+        std::fs::write(&path, "(define lf-var 99)").unwrap();
+        feed(&mut engine, "M-x");
+        type_text(&mut engine, "load-file");
+        feed(&mut engine, "RET");
+        type_text(&mut engine, &path.display().to_string());
+        feed(&mut engine, "RET");
+        check(&mut engine, "(equal? lf-var 99)");
+        with_editor(|ed| {
+            assert!(ed.echo.as_deref().unwrap_or("").starts_with("Loaded"), "{:?}", ed.echo);
+        });
+        std::fs::remove_file(&path).ok();
+
+        // The point of it all: redefine a built-in Scheme command live and
+        // the very next keystroke runs the new definition.
+        feed(&mut engine, "M-:");
+        type_text(
+            &mut engine,
+            r#"(define-command "eval-buffer" "hijacked" (lambda () (message "hijacked!")))"#,
+        );
+        feed(&mut engine, "RET");
+        feed(&mut engine, "M-x");
+        type_text(&mut engine, "eval-buffer");
+        feed(&mut engine, "RET");
+        with_editor(|ed| assert_eq!(ed.echo.as_deref(), Some("hijacked!")));
+    }
+
+    /// Same guard for man.scm (real load position: after compile.scm and
+    /// help.scm, whose quit-window it reuses).
+    #[test]
+    fn man_loads_cleanly() {
+        let mut engine = build_engine();
+        for src in [
+            include_str!("bootstrap.scm"),
+            include_str!("compile.scm"),
+            include_str!("help.scm"),
+            include_str!("man.scm"),
+        ] {
+            engine.compile_and_run_raw_program(src.to_string()).unwrap();
+        }
+    }
+
+    /// The pure halves of man.scm: nroff backspace-overstrike parsing
+    /// (bold/underline spans over cleaned text, runs merged), topic
+    /// translation, and the word-plus-"(3)" default entry at point.
+    #[test]
+    fn man_fontify_and_topic_parsing() {
+        let mut engine = build_engine();
+        load_bootstrap(&mut engine);
+        load_compile(&mut engine);
+        load_help(&mut engine);
+        load_man(&mut engine);
+        let check = |engine: &mut Engine, src: &str| {
+            let result = engine.compile_and_run_raw_program(src.to_string()).unwrap();
+            assert_eq!(
+                format!("{:?}", result.last().unwrap()),
+                "#true",
+                "failed: {src}"
+            );
+        };
+
+        // "N BS N a BS a ..." = bold NAME; "_ BS c" = underlined c. The
+        // backspaces are built from (integer->char 8), same as man.scm.
+        check(
+            &mut engine,
+            r#"(let* ((BS man-backspace)
+                     (raw (string-append
+                           "N" BS "N" "a" BS "a" " ok "
+                           "_" BS "F" "_" BS "I" "LE")))
+                 (equal? (man-fontify-parse raw)
+                         (cons "Na ok FILE"
+                               '((0 2 "Man-overstrike")
+                                 (6 8 "Man-underline")))))"#,
+        );
+        // A char overstruck by an underscore keeps the letter; a trailing
+        // backspace just drops the char before it.
+        check(
+            &mut engine,
+            r#"(equal? (man-fontify-parse
+                        (string-append "x" man-backspace "_" "y" man-backspace))
+                       (cons "x" '((0 1 "Man-underline"))))"#,
+        );
+        // No overstrikes: text passes through untouched.
+        check(
+            &mut engine,
+            r#"(equal? (man-fontify-parse "plain text\n") (cons "plain text\n" '()))"#,
+        );
+
+        // Emacs' reference syntax: "ls(2)" -> "2 ls"; plain topics pass through.
+        check(&mut engine, r#"(equal? (man-translate-topic "ls(2)") "2 ls")"#);
+        check(&mut engine, r#"(equal? (man-translate-topic "2 ls") "2 ls")"#);
+
+        // The apropos->candidates awk pipeline: comma-separated aliases
+        // each become "name(sec)"; unparsable lines contribute nothing.
+        // Driven with fake apropos output substituted for `man -k .`.
+        check(
+            &mut engine,
+            r#"(equal? (string-lines
+                        (car (run-shell-command
+                              (string-append
+                               "printf 'grep, egrep (1)      - print lines\n"
+                               "IO::Socket::IP (3pm) - IP socket\n"
+                               "mandb: nothing appropriate\n' | "
+                               (substring man-apropos-command
+                                          (string-length "man -k . 2>/dev/null | ")
+                                          (string-length man-apropos-command))))))
+                       '("grep(1)" "egrep(1)" "IO::Socket::IP(3pm)"))"#,
+        );
+
+        // The native completion matcher: prefix hits first, then substring
+        // hits, source order kept; empty input passes everything through.
+        check(
+            &mut engine,
+            r#"(equal? (filter-matching '("mandb(8)" "man(1)" "woman(3)" "ls(1)") "man")
+                       '("mandb(8)" "man(1)" "woman(3)"))"#,
+        );
+        check(
+            &mut engine,
+            r#"(equal? (filter-matching '("a" "b") "") '("a" "b"))"#,
+        );
+        check(
+            &mut engine,
+            r#"(equal? (filter-suffix '("a(1)" "b(3)" "c(1)") "(1)") '("a(1)" "c(1)"))"#,
+        );
+
+        // Emacs' "SEC NAME" prompt form completes names within the section
+        // (driven against the real man database, like man_end_to_end).
+        check(
+            &mut engine,
+            r#"(equal? (car (man-completion-candidates "3 malloc")) "malloc(3)")"#,
+        );
+        check(
+            &mut engine,
+            r#"(equal? (filter-suffix (man-completion-candidates "3 mal") "(3)")
+                       (man-completion-candidates "3 mal"))"#,
+        );
+
+        // Default entry: the word at point, keeping a "(3)" suffix.
+        with_editor(|ed| {
+            let (win, buf) = ed.cur();
+            buf.set_text("see printf(3) and ls for details");
+            win.point = 6; // inside "printf"
+        });
+        check(&mut engine, r#"(equal? (man-default-entry) "printf(3)")"#);
+        with_editor(|ed| ed.windows.selected_mut().point = 19); // inside "ls"
+        check(&mut engine, r#"(equal? (man-default-entry) "ls")"#);
+        // The space after "(3)": not touching a word on either side.
+        with_editor(|ed| ed.windows.selected_mut().point = 13);
+        check(&mut engine, r#"(equal? (man-default-entry) "")"#);
+    }
+
+    /// The real thing: (man-getpage "ls") runs the system man in the
+    /// background; when the process exits, the *Man ls* buffer holds the
+    /// cleaned page (no backspaces), read-only in Man mode with bold/
+    /// underline face spans, shown in the other window without stealing
+    /// focus. Needs man + its pages installed, like the dired tests need a
+    /// real filesystem.
+    #[test]
+    fn man_end_to_end() {
+        let mut engine = build_engine();
+        load_bootstrap(&mut engine);
+        load_compile(&mut engine);
+        load_help(&mut engine);
+        load_man(&mut engine);
+
+        engine
+            .compile_and_run_raw_program(r#"(man-getpage "ls")"#.to_string())
+            .unwrap();
+        assert!(
+            with_editor(|ed| !ed.processes.is_empty()),
+            "man did not start (is man installed?)"
+        );
+        pump_until_done(&mut engine);
+
+        let before = with_editor(|ed| ed.cur_buffer().name.clone());
+        with_editor(|ed| {
+            let id = ed.buffer_by_name("*Man ls*").expect("*Man ls* buffer exists");
+            let buf = &ed.buffers[&id];
+            let text = buf.to_string_lossless();
+            assert!(
+                text.contains("ls - list directory contents"),
+                "page text: {:.200}",
+                text
+            );
+            assert!(!text.contains('\u{8}'), "backspaces survived fontifying");
+            assert!(buf.read_only);
+            assert_eq!(buf.mode_name, "Man");
+            assert_eq!(buf.local_map.as_deref(), Some("Man-mode-map"));
+            assert!(
+                !buf.face_spans.is_empty(),
+                "no overstrike spans found (man produced unformatted output?)"
+            );
+            assert_eq!(before, ed.cur_buffer().name, "man stole the selected window");
+        });
+
+        // A repeat request reuses the finished buffer instead of respawning.
+        engine
+            .compile_and_run_raw_program(r#"(man-getpage "ls")"#.to_string())
+            .unwrap();
+        assert!(
+            with_editor(|ed| ed.processes.is_empty()),
+            "second man-getpage respawned the process"
+        );
+
+        // A bogus topic fails without creating a ready page.
+        engine
+            .compile_and_run_raw_program(
+                r#"(man-getpage "definitely-no-such-page-xyz")"#.to_string(),
+            )
+            .unwrap();
+        pump_until_done(&mut engine);
+        with_editor(|ed| {
+            let echo = ed.echo.clone().unwrap_or_default();
+            assert!(
+                echo.contains("definitely-no-such-page-xyz") || echo.contains("man"),
+                "no failure message, echo: {echo:?}"
+            );
+        });
+        let result = engine
+            .compile_and_run_raw_program(
+                r#"(equal? (buffer-local-get-in "*Man definitely-no-such-page-xyz*" "man-ready") #t)"#
+                    .to_string(),
+            )
+            .unwrap();
+        assert_eq!(format!("{:?}", result.last().unwrap()), "#false");
+    }
+
+    /// M-x man completing through the vertico plugin, driven over the real
+    /// key path: the prompt opens with kind "man" and the full apropos
+    /// candidate list; typing narrows it to matching "name(section)"
+    /// entries. Needs a populated man database, like man_end_to_end.
+    #[test]
+    fn man_completion_through_vertico() {
+        let mut engine = build_engine();
+        load_bootstrap(&mut engine);
+        load_compile(&mut engine);
+        load_help(&mut engine);
+        load_man(&mut engine);
+        engine
+            .compile_and_run_raw_program(
+                include_str!("../../examples/vertico.scm").to_string(),
+            )
+            .unwrap();
+
+        let feed = |engine: &mut Engine, keys: &str| {
+            for chord in parse_seq(keys).unwrap() {
+                process_chord(engine, chord);
+            }
+        };
+        let type_text = |engine: &mut Engine, text: &str| {
+            for c in text.chars() {
+                process_chord(engine, crate::keys::Chord {
+                    ctrl: false,
+                    meta: false,
+                    key: crate::keys::Key::Char(c),
+                });
+            }
+        };
+
+        // M-x man RET: the M-x prompt hands over to the man prompt, whose
+        // setup fires vertico with the whole topic list.
+        feed(&mut engine, "M-x");
+        type_text(&mut engine, "man");
+        feed(&mut engine, "RET");
+        with_editor(|ed| {
+            let InputMode::Prompt(p) = &ed.input else {
+                panic!("M-x man did not open a prompt")
+            };
+            assert!(p.prompt.starts_with("Manual entry"), "prompt: {:?}", p.prompt);
+            assert!(
+                p.completions.len() > 100,
+                "expected the full apropos list, got {} candidates",
+                p.completions.len()
+            );
+        });
+
+        // The "SEC NAME" form: candidates come from that section only.
+        type_text(&mut engine, "3 mall");
+        with_editor(|ed| {
+            let InputMode::Prompt(p) = &ed.input else { panic!() };
+            assert!(!p.completions.is_empty(), "no candidates for '3 mall'");
+            assert_eq!(p.completions[0], "malloc(3)", "candidates: {:?}",
+                &p.completions[..p.completions.len().min(5)]);
+            assert!(
+                p.completions.iter().all(|c| c.ends_with("(3)")),
+                "candidates outside section 3: {:?}",
+                &p.completions[..p.completions.len().min(5)]
+            );
+        });
+        for _ in 0..6 {
+            feed(&mut engine, "backspace");
+        }
+
+        // Typing narrows to matching "name(section)" candidates.
+        type_text(&mut engine, "printf");
+        with_editor(|ed| {
+            let InputMode::Prompt(p) = &ed.input else { panic!() };
+            assert!(!p.completions.is_empty(), "no candidates for printf");
+            assert!(
+                p.completions.iter().all(|c| c.contains("printf")),
+                "unrelated candidates: {:?}",
+                &p.completions[..p.completions.len().min(5)]
+            );
+            assert!(
+                p.completions[0] == "printf(1)" || p.completions[0] == "printf(3)",
+                "shortest prefix match should rank first: {:?}",
+                &p.completions[..p.completions.len().min(5)]
+            );
+        });
+        feed(&mut engine, "C-g");
+        with_editor(|ed| assert!(matches!(ed.input, InputMode::Normal)));
+    }
+
     /// Same guard for dired.scm: a syntax error there would otherwise only
     /// surface as an echo-line message the first time a directory is opened.
     /// Stacked in the real load order (bootstrap -> compile -> dired), since
@@ -968,6 +1379,7 @@ mod tests {
             (include_str!("bootstrap.scm"), "bootstrap.scm"),
             (include_str!("compile.scm"), "compile.scm"),
             (include_str!("help.scm"), "help.scm"),
+            (include_str!("man.scm"), "man.scm"),
             (include_str!("dired.scm"), "dired.scm"),
             (include_str!("rust-mode.scm"), "rust-mode.scm"),
             (include_str!("python-mode.scm"), "python-mode.scm"),
@@ -1469,6 +1881,9 @@ mod tests {
     fn vertico_plugin_end_to_end() {
         let mut engine = build_engine();
         load_bootstrap(&mut engine);
+        load_compile(&mut engine);
+        load_help(&mut engine);
+        load_man(&mut engine); // vertico's man source is man.scm's
         engine
             .compile_and_run_raw_program(
                 include_str!("../../examples/vertico.scm").to_string(),
@@ -1538,6 +1953,9 @@ mod tests {
 
         let mut engine = build_engine();
         load_bootstrap(&mut engine);
+        load_compile(&mut engine);
+        load_help(&mut engine);
+        load_man(&mut engine); // vertico's man source is man.scm's
         engine
             .compile_and_run_raw_program(
                 include_str!("../../examples/vertico.scm").to_string(),

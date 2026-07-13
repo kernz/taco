@@ -371,3 +371,110 @@
 (define-command "comment-dwim"
   "Comment/uncomment the region, or toggle a trailing comment on the current line."
   comment-dwim)
+
+;; ---- Runtime evaluation (M-:, C-x C-e, eval-buffer, load-file) --------------------
+;; The editor's own interpreter, reachable from inside the editor — what
+;; makes taco hackable live, Emacs-style: redefine any Scheme-level command
+;; or helper in a scratch buffer, evaluate it, and the running editor
+;; changes immediately. eval-string and load are Steel's own primitives,
+;; executing inside the already-active VM (no Rust round-trip involved).
+
+;; Start offset of the s-expression ending exactly at the end of `text`,
+;; or #f. A tiny forward reader — forward, because a backward scan cannot
+;; know whether a paren sits inside a string literal — tracking nesting,
+;; strings (with \" escapes) and ; comments. Limitation: a trailing
+;; comment between the sexp and point hides the sexp.
+(define (sexp-start-before text)
+  (let ((len (string-length text)))
+    (let loop ((i 0) (stack '()) (tok #f) (in-str #f) (esc #f) (in-cmt #f) (last #f))
+      (if (>= i len)
+          (let ((last (cond (in-str #f)              ; unterminated string
+                            (tok (cons tok len))     ; atom runs to the end
+                            (else last))))
+            (if (and last (= (cdr last) len))
+                (sexp-prefix-start text (car last))
+                #f))
+          (let ((c (substring text i (+ i 1))))
+            (cond
+             (in-cmt (loop (+ i 1) stack #f #f #f (not (equal? c "\n")) last))
+             (in-str
+              (cond (esc (loop (+ i 1) stack tok #t #f #f last))
+                    ((equal? c "\\") (loop (+ i 1) stack tok #t #t #f last))
+                    ((equal? c "\"") (loop (+ i 1) stack #f #f #f #f (cons tok (+ i 1))))
+                    (else (loop (+ i 1) stack tok #t #f #f last))))
+             ((equal? c "\"")
+              (loop (+ i 1) stack i #t #f #f (if tok (cons tok i) last)))
+             ((equal? c ";")
+              (loop (+ i 1) stack #f #f #f #t (if tok (cons tok i) last)))
+             ((equal? c "(")
+              (loop (+ i 1) (cons i stack) #f #f #f #f (if tok (cons tok i) last)))
+             ((equal? c ")")
+              (let ((last (if tok (cons tok i) last)))
+                (if (null? stack)
+                    (loop (+ i 1) stack #f #f #f #f last) ; stray closer
+                    (loop (+ i 1) (cdr stack) #f #f #f #f
+                          (cons (car stack) (+ i 1))))))
+             ((member c '(" " "\n" "\t"))
+              (loop (+ i 1) stack #f #f #f #f (if tok (cons tok i) last)))
+             (else
+              (loop (+ i 1) stack (if tok tok i) #f #f #f last))))))))
+
+;; Reader prefixes (' ` ,) stick to the form they quote.
+(define (sexp-prefix-start text start)
+  (if (and (> start 0)
+           (member (substring text (- start 1) start) '("'" "`" ",")))
+      (sexp-prefix-start text (- start 1))
+      start))
+
+(define (last-sexp-before-point)
+  (let* ((upto (substring (buffer-string) 0 (point)))
+         (end (let loop ((i (string-length upto)))
+                (if (and (> i 0)
+                         (member (substring upto (- i 1) i) '(" " "\n" "\t")))
+                    (loop (- i 1))
+                    i)))
+         (text (substring upto 0 end))
+         (start (sexp-start-before text)))
+    (if (equal? start #f) "" (substring text start end))))
+
+(define (eval-expression)
+  (read-string "Eval: " "" ""
+    (lambda (src)
+      (unless (equal? src "")
+        (message (to-string (eval-string src)))))))
+
+(define (eval-last-sexp)
+  (let ((src (last-sexp-before-point)))
+    (if (equal? src "")
+        (message "No s-expression before point")
+        (message (to-string (eval-string src))))))
+
+(define (eval-buffer)
+  (eval-string (buffer-string))
+  (message (string-append "Evaluated buffer " (current-buffer))))
+
+(define (load-file)
+  (read-string "Load file: " "" "file"
+    (lambda (path)
+      (let ((p (resolve-path path)))
+        (if (file-exists? p)
+            (begin
+              (load p)
+              (message (string-append "Loaded " p)))
+            (message (string-append "No such file: " p)))))))
+
+(define-command "eval-expression"
+  "Evaluate a Scheme expression and echo its value."
+  eval-expression)
+(define-command "eval-last-sexp"
+  "Evaluate the s-expression before point and echo its value."
+  eval-last-sexp)
+(define-command "eval-buffer"
+  "Evaluate the whole current buffer as Scheme."
+  eval-buffer)
+(define-command "load-file"
+  "Load a Scheme file into the running editor."
+  load-file)
+
+(global-set-key "M-:" "eval-expression")
+(global-set-key "C-x C-e" "eval-last-sexp")
