@@ -159,6 +159,11 @@
 
 ;; ---- fetching and displaying a page -----------------------------------------------
 
+;; Emacs' Man-width-max: format for the window, but never wider than this
+;; many columns — in a wide frame the page keeps a readable measure and
+;; the window's right side stays blank, instead of stretching edge to edge.
+(define Man-width-max 80)
+
 (define (man-first-line s) (car (string-split-char s "\n")))
 
 ;; Render the accumulated raw output into `bufname` and show it in the
@@ -198,10 +203,12 @@
       (message (string-append "Already formatting " bufname)))
      (else
       (let* ((args (man-translate-topic topic))
-             ;; MANWIDTH makes man format for our window; the other two
-             ;; force overstrike output into the pipe (see file header).
+             ;; MANWIDTH makes man format for our window (capped at
+             ;; Man-width-max, as in Emacs); the other two force
+             ;; overstrike output into the pipe (see file header).
              (cmd (string-append
-                   "MANWIDTH=" (number->string (max 30 (- (window-width) 1)))
+                   "MANWIDTH=" (number->string
+                                (max 30 (min Man-width-max (- (window-width) 1))))
                    " GROFF_NO_SGR=1 MAN_KEEP_FORMATTING=1 man " args))
              (id (start-process "man" bufname ""
                    cmd
